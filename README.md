@@ -1,4 +1,4 @@
-# CGT-AI Framework 
+# CGT-AI Framework
 
 A Python AI framework for Combinatorial Game Theory with Numba acceleration support.
 
@@ -19,6 +19,7 @@ Unlike existing CGT libraries that focus on mathematical game analysis, CGT-AI i
 - **Engine Wrappers** — Built-in boilerplate for XBoard, UCI, and boardgame.io (WebAssembly via monkey-patching).
 - **Player State Queries** — Built-in win/loss determination for both players with automatic inference from `current_player()` and `legal_moves()`.
 - **Game State Transitions** — `apply()` method for deterministic state progression.
+- **Player-Aware Values** — `CGTValue` supports negation for left/right symmetry and tracks which player the evaluation favors.
 
 
 ## Architecture
@@ -126,9 +127,59 @@ class MyGame(CGTGame):
 | `is_right_win()` | Right player has winning strategy | `current_player() == 'right' and is_current_player_win()` |
 | `is_right_lose()` | Right player has losing strategy | `current_player() == 'right' and is_current_player_lose()` |
 
+### CGTValue
+
+A `CGTValue` represents the evaluation of a game state. It must be a comparable `DataObject` implementing `__lt__`, `__eq__`, `__neg__`, and `current_player()`:
+
+```python
+from cgt_ai import CGTValue
+
+class MyValue(CGTValue):
+    def __init__(self, score, player='left'):
+        self._score = score
+        self._player = player  # 'left' or 'right'
+    
+    def current_player(self):
+        """Returns which player this value is evaluated for"""
+        return self._player
+    
+    def __lt__(self, other):
+        """Less than comparison for ordering"""
+        if self._player != other._player:
+            # Values from different perspectives need negation
+            if self._player == 'left':
+                return -self < other  # Negate self to compare from right's perspective
+        return self._score < other._score
+    
+    def __eq__(self, other):
+        """Equality comparison"""
+        if self._player != other._player:
+            if self._player == 'left':
+                return -self == other
+        return self._score == other._score
+    
+    def __neg__(self):
+        """Negate the value (good for left becomes good for right)"""
+        return MyValue(-self._score, 'right' if self._player == 'left' else 'left')
+    
+    def __repr__(self):
+        return f"CGTValue({self._score}, {self._player})"
+```
+
+**Key Properties of CGTValue:**
+
+| Method | Description |
+|--------|-------------|
+| `current_player()` | Returns `"left"` or `"right"` indicating which player the evaluation favors |
+| `__neg__()` | Negates the value, flipping the perspective from left to right or vice versa |
+| `__lt__()` | Comparison that properly handles perspective differences |
+| `__eq__()` | Equality that handles perspective differences |
+
+**Important:** A positive value from left's perspective means a better position for left. When negated, it becomes a better position for right.
+
 ### ValueFunction
 
-A `ValueFunction` encapsulates evaluation logic. It contains source code defining an `evaluate` variable, inspectable via `inspect.getsignature`. The function accepts a `CGTGame` and returns a `CGTValue` (a comparable `DataObject` implementing `__lt__` and `__eq__`).
+A `ValueFunction` encapsulates evaluation logic. It contains source code defining an `evaluate` variable, inspectable via `inspect.getsignature`. The function accepts a `CGTGame` and returns a `CGTValue`:
 
 ```python
 from cgt_ai import ValueFunction, TotalValueFunction
@@ -136,14 +187,20 @@ from cgt_ai import ValueFunction, TotalValueFunction
 @ValueFunction
 def material_score(game):
     """Simple material count evaluation."""
-    return CGTValue(game.material_advantage())
+    score = game.material_advantage()  # Positive = good for left
+    return MyValue(score, game.current_player())
 
 @TotalValueFunction
 def winning_determination(game):
     """Total evaluation — always returns a value."""
     if game.is_terminal():
-        return CGTValue(float('inf') if game.is_win() else float('-inf'))
-    return CGTValue(0.0)
+        if game.is_left_win():
+            return MyValue(float('inf'), 'left')
+        elif game.is_right_win():
+            return MyValue(float('inf'), 'right')
+        else:
+            return MyValue(0, game.current_player())
+    return MyValue(0.0, game.current_player())
 ```
 
 Value functions can be chained with the `>>` operator. The chain runs functions in order, falling back to the next if a `ValueError` is raised:
@@ -253,6 +310,7 @@ The framework leverages Numba to JIT-compile performance-critical sections:
 - **Evaluation functions** — JIT-compiled value function bodies
 - **Search internals** — Core search loops and node expansions
 - **Apply operations** — Fast state transitions
+- **Value operations** — `__neg__` and comparison methods can be JIT-compiled
 
 Example of accelerating a game:
 
@@ -287,7 +345,7 @@ For GPU acceleration, the framework supports `numba.cuda` for parallel MCTS.
 ## Quick Example
 
 ```python
-from cgt_ai import CGTGame, CGTStep, mcts, ValueFunction
+from cgt_ai import CGTGame, CGTStep, CGTValue, mcts, ValueFunction
 from datetime import datetime, timedelta
 
 # Define a simple Nim game
@@ -315,6 +373,30 @@ class NimGame(CGTGame):
         next_turn = 'right' if self._turn == 'left' else 'left'
         return NimGame(new_piles, next_turn)
 
+# Define a custom CGTValue
+class NimValue(CGTValue):
+    def __init__(self, xor_sum, player):
+        self._xor = xor_sum
+        self._player = player
+    
+    def current_player(self):
+        return self._player
+    
+    def __lt__(self, other):
+        if self._player != other._player:
+            if self._player == 'left':
+                return -self < other
+        return self._xor < other._xor
+    
+    def __eq__(self, other):
+        if self._player != other._player:
+            if self._player == 'left':
+                return -self == other
+        return self._xor == other._xor
+    
+    def __neg__(self):
+        return NimValue(-self._xor, 'right' if self._player == 'left' else 'left')
+
 # Define a value function
 @ValueFunction
 def nim_value(game):
@@ -322,8 +404,12 @@ def nim_value(game):
     xor_sum = 0
     for p in game.piles:
         xor_sum ^= p
-    # Negative if left is losing, positive if winning
-    return CGTValue(xor_sum if game.current_player() == 'left' else -xor_sum)
+    # Positive value means good for current player
+    # Negative value means bad for current player
+    if game.current_player() == 'left':
+        return NimValue(xor_sum, 'left')
+    else:
+        return NimValue(-xor_sum, 'right')
 
 # Search for the best move
 searcher = mcts(iterations=1000)
@@ -333,7 +419,14 @@ value_before, best_move, value_after = searcher(
     deadline=datetime.now() + timedelta(seconds=1)
 )
 
+print(f"Value before: {value_before}")          # Shows value and perspective
 print(f"Best move: take {best_move.count} from pile {best_move.pile}")
+print(f"Value after: {value_after}")
+
+# Demonstrate negation
+left_value = NimValue(5, 'left')
+right_value = -left_value
+print(f"{left_value} negated is {right_value}")  # Perspective flips
 
 # Query player states
 game = NimGame([1, 2, 3])
@@ -367,6 +460,7 @@ print(f"After move, current player: {new_game.current_player()}")  # "right"
 - **Automatic win/loss inference** — Only `current_player()` needs to be implemented; all win/loss logic is derived
 - **Separation of concerns** — Searchers accept value functions as parameters, keeping search logic independent of evaluation
 - **Deterministic transitions** — `apply()` ensures reproducible game state progression
+- **Player-aware values** — `CGTValue` supports negation and perspective tracking, enabling proper comparison across players
 
 
 ## Installation
