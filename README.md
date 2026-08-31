@@ -1,4 +1,4 @@
-# CGT-AI Framework
+# CGT-AI Framework 
 
 A Python AI framework for Combinatorial Game Theory with Numba acceleration support.
 
@@ -17,6 +17,7 @@ Unlike existing CGT libraries that focus on mathematical game analysis, CGT-AI i
 - **Composable Value Functions** — Chain multiple evaluation functions with fallback semantics (`ValueFunction >> ValueFunction`).
 - **Pluggable Searchers** — MCTS, Minimax, Alpha-Beta, and custom search algorithms with a unified interface.
 - **Engine Wrappers** — Built-in boilerplate for XBoard, UCI, and boardgame.io (WebAssembly via monkey-patching).
+- **Player State Queries** — Built-in win/loss determination for both players with automatic inference from `current_player()` and `legal_moves()`.
 
 
 ## Architecture
@@ -63,19 +64,51 @@ class MoveStep(CGTStep):
 
 ### CGTGame
 
-A `CGTGame` defines the rules of a combinatorial game. The key interface is `legal_moves()`, which generates compatible `CGTStep` objects:
+A `CGTGame` defines the rules of a combinatorial game. The key interface is `current_player()` and `legal_moves()`, with automatic win/loss determination:
 
 ```python
 from cgt_ai import CGTGame
 
 class MyGame(CGTGame):
+    def current_player(self):
+        """Returns 'left' or 'right'"""
+        return self._turn
+    
     def legal_moves(self):
-        # May be infinite — returns a generator
+        """Generates compatible CGTStep objects (may be infinite)"""
         for x in range(self.width):
             for y in range(self.height):
                 if self._is_legal(x, y):
                     yield MoveStep(x, y)
+    
+    # Optional: override for custom win/loss logic
+    def is_current_player_win(self):
+        """Returns True if current player has a winning strategy"""
+        return not self.is_current_player_lose()
+    
+    # All other win/loss methods are automatically derived:
+    # - is_current_player_lose(): no legal moves (default)
+    # - is_previous_player_win(): not is_current_player_lose()
+    # - is_previous_player_lose(): not is_current_player_win()
+    # - is_left_win(): self.current_player() == 'left' and is_current_player_win()
+    # - is_left_lose(): self.current_player() == 'left' and is_current_player_lose()
+    # - is_right_win(): self.current_player() == 'right' and is_current_player_win()
+    # - is_right_lose(): self.current_player() == 'right' and is_current_player_lose()
 ```
+
+**Win/Loss Methods Summary:**
+
+| Method | Description | Default Implementation |
+|--------|-------------|----------------------|
+| `current_player()` | Returns `"left"` or `"right"` | **Must be implemented** |
+| `is_current_player_win()` | Current player has winning strategy | Not `is_current_player_lose()` |
+| `is_current_player_lose()` | Current player has losing strategy | No legal moves |
+| `is_previous_player_win()` | Previous player has winning strategy | Not `is_current_player_lose()` |
+| `is_previous_player_lose()` | Previous player has losing strategy | Not `is_current_player_win()` |
+| `is_left_win()` | Left player has winning strategy | `current_player() == 'left' and is_current_player_win()` |
+| `is_left_lose()` | Left player has losing strategy | `current_player() == 'left' and is_current_player_lose()` |
+| `is_right_win()` | Right player has winning strategy | `current_player() == 'right' and is_current_player_win()` |
+| `is_right_lose()` | Right player has losing strategy | `current_player() == 'right' and is_current_player_lose()` |
 
 ### ValueFunction
 
@@ -168,9 +201,72 @@ class FastGame(CGTGame):
     def legal_moves(self):
         # Hot loop — compiled to native code
         ...
+        
+    @jit(nopython=True)
+    def current_player(self):
+        # Fast path for turn determination
+        return self._turn
 ```
 
 For GPU acceleration, the framework supports `numba.cuda` for parallel MCTS.
+
+
+## Quick Example
+
+```python
+from cgt_ai import CGTGame, CGTStep, mcts, ValueFunction
+from datetime import datetime, timedelta
+
+# Define a simple Nim game
+class NimStep(CGTStep):
+    def __init__(self, pile, count):
+        self.pile = pile
+        self.count = count
+
+class NimGame(CGTGame):
+    def __init__(self, piles, turn='left'):
+        self.piles = list(piles)
+        self._turn = turn
+    
+    def current_player(self):
+        return self._turn
+    
+    def legal_moves(self):
+        for i, count in enumerate(self.piles):
+            for take in range(1, count + 1):
+                yield NimStep(i, take)
+    
+    def apply(self, step):
+        new_piles = self.piles.copy()
+        new_piles[step.pile] -= step.count
+        next_turn = 'right' if self._turn == 'left' else 'left'
+        return NimGame(new_piles, next_turn)
+
+# Define a value function
+@ValueFunction
+def nim_value(game):
+    # Sprague-Grundy for Nim
+    xor_sum = 0
+    for p in game.piles:
+        xor_sum ^= p
+    # Negative if left is losing, positive if winning
+    return CGTValue(xor_sum if game.current_player() == 'left' else -xor_sum)
+
+# Search for the best move
+searcher = mcts(iterations=1000)
+value_before, best_move, value_after = searcher(
+    NimGame([3, 4, 5]), 
+    deadline=datetime.now() + timedelta(seconds=1)
+)
+
+print(f"Best move: take {best_move.count} from pile {best_move.pile}")
+
+# Query player states
+game = NimGame([1, 2, 3])
+print(f"Current player: {game.current_player()}")           # "left"
+print(f"Left wins? {game.is_left_win()}")                   # True if left has winning strategy
+print(f"Right loses? {game.is_right_lose()}")               # True if right has losing strategy
+```
 
 
 ## Related Work
@@ -190,52 +286,7 @@ For GPU acceleration, the framework supports `numba.cuda` for parallel MCTS.
 - **Serialization by design** — Every object is persistable, enabling saving/loading game states, evaluation functions, and search results
 - **Value function chaining** — Composable evaluation with graceful fallback
 - **Cross-framework compatibility** — XBoard, UCI, boardgame.io out of the box
-
-
-## Quick Example
-
-```python
-from cgt_ai import CGTGame, CGTStep, mcts, ValueFunction
-from datetime import datetime, timedelta
-
-# Define a simple Nim game
-class NimStep(CGTStep):
-    def __init__(self, pile, count):
-        self.pile = pile
-        self.count = count
-
-class NimGame(CGTGame):
-    def __init__(self, piles):
-        self.piles = list(piles)
-    
-    def legal_moves(self):
-        for i, count in enumerate(self.piles):
-            for take in range(1, count + 1):
-                yield NimStep(i, take)
-    
-    def apply(self, step):
-        new_piles = self.piles.copy()
-        new_piles[step.pile] -= step.count
-        return NimGame(new_piles)
-
-# Define a value function
-@ValueFunction
-def nim_value(game):
-    # Sprague-Grundy for Nim
-    xor_sum = 0
-    for p in game.piles:
-        xor_sum ^= p
-    return CGTValue(0 if xor_sum == 0 else 1)
-
-# Search for the best move
-searcher = mcts(iterations=1000)
-value_before, best_move, value_after = searcher(
-    NimGame([3, 4, 5]), 
-    deadline=datetime.now() + timedelta(seconds=1)
-)
-
-print(f"Best move: take {best_move.count} from pile {best_move.pile}")
-```
+- **Automatic win/loss inference** — Only `current_player()` needs to be implemented; all win/loss logic is derived
 
 
 ## Installation
